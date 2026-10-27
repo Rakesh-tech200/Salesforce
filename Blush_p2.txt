@@ -1,0 +1,268 @@
+Phase 2: Record types and custom fields
+You'll build the customer-facing data model: Lead, Contact, Account, Opportunity, Campaign, Task and Event.
+Two rules for this phase
+Record Type Name (API) must be exactly Retail and Wholesale everywhere. Formulas, flows and Apex later look them up by these names.
+Validation rules for these objects come in Phase 5, not now.
+For every field in this phase, the wizard is: Object Manager → [object] → Fields & Relationships → New → pick type → Next → enter Label, Field Name and details → Next → (field-level security: leave defaults) → Next → (page layouts: as stated per step) → Save & New. For the last field, click Save.
+Step 2.1: Lead
+2.1.1 Create three fields
+Go to Setup → Object Manager → Lead → Fields & Relationships → New.
+Label
+Field Name
+Type
+Details
+Customer Type
+Customer_Type
+Picklist
+Values (one per line): Retail, Wholesale. Leave Use first value as default unticked
+Possible Duplicate
+Possible_Duplicate
+Checkbox
+Default: Unchecked
+Phone Last10
+Phone_Last10
+Formula → return type Text
+Formula below
+Formula for Phone_Last10 (paste exactly; the editor may show it on one line):
+IF(ISBLANK(Phone), "",
+RIGHT(
+SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(Phone," ",""),"-",""),"+",""),"(",""),")",""),".",""),"/",""),
+10))
+Click Check Syntax before continuing. Add all three fields to the standard Lead Layout (leave it ticked at the layout step).
+2.1.2 Create Lead list views
+App Launcher (nine dots) → Leads.
+Click the list view dropdown (top left, "Recently Viewed") → New.
+Create these three views. For each, set List Name, Who sees this list view = All users, then Save. Add the filters in the filter panel, then Save again.
+List Name
+Filter by Owner
+Additional filter
+Retail Leads
+All leads
+Customer Type equals Retail
+Wholesale Leads
+All leads
+Customer Type equals Wholesale
+Possible Duplicate Leads
+All leads
+Possible Duplicate equals True
+Step 2.2: Contact
+Create one field on Object Manager → Contact:
+Label
+Field Name
+Type
+Phone Last10
+Phone_Last10
+Formula → Text
+Formula (same logic, applied to the Contact's Phone):
+IF(ISBLANK(Phone), "",
+RIGHT(
+SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(Phone," ",""),"-",""),"+",""),"(",""),")",""),".",""),"/",""),
+10))
+Add it to the standard Contact Layout. Contact has no record types; it follows its Account.
+Step 2.3: Account (Retail and Wholesale)
+2.3.1 Clone two page layouts first
+The record type wizard asks which layout to use, so layouts come first.
+Object Manager → Account → Page Layouts.
+On the row Account Layout, click the ▼ at the far right → Clone.
+Name it Retail Account Layout → Save.
+Repeat: clone Account Layout again → Wholesale Account Layout → Save.
+2.3.2 Create the two record types
+Object Manager → Account → Record Types → New.
+Enter:
+Existing Record Type: Master
+Record Type Label: Retail
+Record Type Name: Retail
+Description: B2C retail customers
+Active: ticked
+In the profile list, tick Make Available for System Administrator and Make Default for it.
+Click Next. Choose Apply one layout to all profiles, select Retail Account Layout, then Save.
+Repeat for Wholesale:
+Record Type Label and Name: Wholesale
+Description: B2B wholesale customers
+Make Available for System Administrator; do not tick Make Default
+Layout: Wholesale Account Layout
+2.3.3 Compact layout (so the record type shows at the top of every record)
+Object Manager → Account → Compact Layouts → New.
+Label: Blush Account Compact.
+Move these fields to Selected Fields, in this order: Account Name, Record Type, Phone, Account Owner.
+Save.
+Click Compact Layout Assignment → Edit Assignment, set Primary Compact Layout = Blush Account Compact, Save.
+2.3.4 Account list views
+In App Launcher → Accounts, create two views the same way as for Leads (All users, owner filter All accounts):
+List Name
+Additional filter
+Retail Accounts
+Record Type equals Retail
+Wholesale Accounts
+Record Type equals Wholesale
+Step 2.4: Opportunity (Retail and Wholesale)
+2.4.1 Clone layouts
+Object Manager → Opportunity → Page Layouts. Clone Opportunity Layout twice: Retail Opportunity Layout and Wholesale Opportunity Layout.
+2.4.2 Create the record types
+Object Manager → Opportunity → Record Types → New. Do it twice.
+Setting
+Retail
+Wholesale
+Existing Record Type
+Master
+Master
+Sales Process
+Standard (pick whatever the dropdown offers if not named exactly so)
+same
+Label / Name
+Retail / Retail
+Wholesale / Wholesale
+Active
+ticked
+ticked
+System Administrator
+Make Available + Make Default
+Make Available
+Layout
+Retail Opportunity Layout
+Wholesale Opportunity Layout
+2.4.3 Create the custom fields
+Go to Opportunity → Fields & Relationships → New. At the Add to Page Layouts step, tick only Retail Opportunity Layout and Wholesale Opportunity Layout.
+Label
+Field Name
+Type
+Details
+Customer Name
+Customer_Name
+Text
+Length 120
+Customer Email
+Customer_Email
+Email
+
+
+Customer Phone
+Customer_Phone
+Phone
+
+
+Customer Processed
+Customer_Processed
+Checkbox
+Default Unchecked
+Reminder Sent
+Reminder_Sent
+Checkbox
+Default Unchecked
+Order Created
+Order_Created
+Checkbox
+Default Unchecked
+The three checkboxes are set by Apex and Flows. Phase 10 will make them read-only for Sales users.
+Opportunity doesn't need a Phone_Last10 field. The Apex in Phase 6 will normalise the phone number in code.
+2.4.4 Compact layout
+Same method as Account: Compact Layouts → New, label Blush Opportunity Compact, fields in order: Opportunity Name, Record Type, Stage, Amount, Close Date, Account Name. Save, then Compact Layout Assignment → Edit Assignment → Primary = Blush Opportunity Compact.
+2.4.5 Opportunity list views
+In App Launcher → Opportunities, create these (All users, owner filter All opportunities):
+List Name
+Additional filter
+Retail Opportunities
+Record Type equals Retail
+Wholesale Opportunities
+Record Type equals Wholesale
+2.4.6 Put the Discount field on the Opportunity Product layout
+The Create Order flow will copy each line's discount percentage later.
+Object Manager → Opportunity Product → Page Layouts → Opportunity Product Layout (click the name).
+In the layout editor, find Discount in the field palette and drag it into the field section if it isn't already there. If Discount isn't in the palette, it's already on the layout.
+Click Save.
+2.4.7 Test that an Opportunity can be saved without an Account
+App Launcher → Opportunities → New.
+Choose Retail. Enter Opportunity Name Test no account, Close Date = any date, Stage = Prospecting. Leave Account Name blank.
+Click Save.
+If it saves: delete the record (▼ → Delete).
+If it demands an Account: tell me immediately, because the Phase 6 design needs a small change.
+Step 2.5: Campaign
+2.5.1 Give yourself the Marketing User checkbox
+Creating campaigns requires it.
+Setup → Users → Users → click your name → Edit.
+Tick Marketing User, then Save. This uses one of your two Marketing User licences, so one stays free for the Marketing test user later.
+2.5.2 Create the "Active This Month" formula
+Object Manager → Campaign → Fields & Relationships → New → Formula.
+Label: Active This Month, Field Name: Active_This_Month, Return type: Checkbox.
+Formula:
+AND(
+  NOT(ISPICKVAL(Status, "Aborted")),
+  NOT(ISBLANK(StartDate)),
+  StartDate <= ADDMONTHS(DATE(YEAR(TODAY()), MONTH(TODAY()), 1), 1) - 1,
+  OR(ISBLANK(EndDate), EndDate >= DATE(YEAR(TODAY()), MONTH(TODAY()), 1))
+)
+Check Syntax, add it to the Campaign Layout, Save.
+This means a campaign counts when it starts on or before the last day of this month, ends on or after the first day (or has no end date), and isn't Aborted. A campaign with no Start Date never counts.
+2.5.3 Create the list view
+App Launcher → Campaigns → list view dropdown → New.
+List Name: Campaigns Active This Month, All users.
+Filter: All campaigns and Active This Month equals True. Save.
+Step 2.6: Task and Event
+Object
+Label
+Field Name
+Type
+Default
+Task
+Is Reminder
+Is_Reminder
+Checkbox
+Unchecked
+Event
+Completed
+Completed
+Checkbox
+Unchecked
+Go to Object Manager → Task → Fields & Relationships → New, and likewise for Event. Add each to its object's page layout (Task Layout, Event Layout).
+If after creating them you see both fields on both objects, that's normal. Activity custom fields can be shared between Tasks and Events.
+Step 2.7: Tidy System Administrator's record-type choices
+If the New Account or New Opportunity screen offers --Master-- or Master as a record type, remove it.
+Setup → Profiles → System Administrator → Object Settings → Accounts → Edit.
+In the Record Types and Page Layout Settings section, make sure only Retail and Wholesale are selected. Set Retail as default. Remove --Master-- if it's listed.
+Save. Repeat for Opportunities.
+If the screen won't let you remove Master, skip this step and don't worry about it.
+Phase 2 checkpoint (run these tests)
+Create these test records, check the results, then delete the test Leads and Campaigns afterwards. Keep the Retail test Account.
+#
+Test
+Expected result
+1
+New Retail Account named Test Retail Customer, Phone +91 98765-43210
+Saves; highlights panel shows the Record Type
+2
+New Wholesale Account Test Wholesale Co
+Saves with the Wholesale layout
+3
+New Lead: Last Name Tester, Company Individual, Phone (020) 2555 0101
+Open it: Phone Last10 = 2025550101
+4
+New Lead with Phone +91 98765 43210
+Phone Last10 = 9876543210
+5
+New Contact on the Retail test Account with Phone 098765-43210
+Phone Last10 = 9876543210
+6
+Campaign T1: Start = today, End = 7 days from now
+Active This Month = checked, and it appears in the list view
+7
+Campaign T2: Start = 2 months ago, End = 1 month ago
+Active This Month unchecked
+8
+Campaign T3: Start = today, no End Date
+Checked
+9
+Campaign T4: Start = today, Status = Aborted
+Unchecked
+10
+Opportunity with Customer Name, Email and Phone fields
+All three fields visible on the layout; the three flag checkboxes are visible too
+Final checklist
+[ ] Lead has 3 fields and 3 list views
+[ ] Contact has Phone_Last10
+[ ] Account has Retail and Wholesale record types, layouts, compact layout and list views
+[ ] Opportunity has Retail and Wholesale record types, 6 fields, compact layout and list views
+[ ] Discount is on the Opportunity Product layout
+[ ] Campaign formula and list view work (tests 6–9 pass)
+[ ] Task Is_Reminder and Event Completed exist
+[ ] An Opportunity saves without an Account (step 2.4.7)
+Tell me anything that behaved differently, especially tests 3–9 and step 2.4.7. Then reply next for Phase 3: Products, price books, data load and the Product2 Apex trigger with its test class.
