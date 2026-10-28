@@ -1,0 +1,114 @@
+public with sharing class ProductPricebookSync {
+
+public static final String RETAIL_BOOK = 'Retail Price Book';
+public static final String WHOLESALE_BOOK = 'Wholesale Price Book';
+
+// Called by ProductTrigger. Every product in the save is re-synced,
+// so a missing entry is repaired the next time the product is saved.
+public static void handle(List<Product2> products) {
+List<Product2> toSync = new List<Product2>();
+for (Product2 p : products) {
+if (p.Retail_Price__c != null) {
+toSync.add(p);
+}
+}
+if (toSync.isEmpty()) {
+return;
+}
+
+// 1. Find the two custom price books by name
+List<String> bookNames = new List<String>{ RETAIL_BOOK, WHOLESALE_BOOK };
+Map<String, Id> bookIds = new Map<String, Id>();
+for (Pricebook2 pb : [SELECT Id, Name FROM Pricebook2 WHERE Name IN :bookNames]) {
+bookIds.put(pb.Name, pb.Id);
+}
+if (!bookIds.containsKey(RETAIL_BOOK) || !bookIds.containsKey(WHOLESALE_BOOK)) {
+for (Product2 p : toSync) {
+p.addError('Price books "' + RETAIL_BOOK + '" and "' + WHOLESALE_BOOK
++ '" must exist before products can be saved.');
+}
+return;
+}
+Id retailId = bookIds.get(RETAIL_BOOK);
+Id wholesaleId = bookIds.get(WHOLESALE_BOOK);
+// Tests cannot query the standard price book, so they use the Test method.
+Id standardId = Test.isRunningTest()
+? Test.getStandardPricebookId()
+: [SELECT Id FROM Pricebook2 WHERE IsStandard = true LIMIT 1].Id;
+
+// 2. Wholesale discount % comes from the Blush Setting record (falls back to 30)
+Blush_Setting__mdt setting = Blush_Setting__mdt.getInstance('Default');
+Decimal discountPct = (setting == null) ? 30 : setting.Wholesale_Discount_Pct__c;
+
+// 3. Load the entries that already exist for these products
+Set<Id> productIds = new Map<Id, Product2>(toSync).keySet();
+Set<Id> allBooks = new Set<Id>{ standardId, retailId, wholesaleId };
+Map<String, PricebookEntry> existing = new Map<String, PricebookEntry>();
+for (PricebookEntry e : [
+SELECT Id, Product2Id, Pricebook2Id, UnitPrice, IsActive
+FROM PricebookEntry
+WHERE Product2Id IN :productIds AND Pricebook2Id IN :allBooks
+]) {
+existing.put(key(e.Product2Id, e.Pricebook2Id), e);
+}
+
+// 4. Decide what to insert and what to update
+List<PricebookEntry> standardInserts = new List<PricebookEntry>();
+List<PricebookEntry> otherInserts = new List<PricebookEntry>();
+Map<Id, PricebookEntry> updates = new Map<Id, PricebookEntry>();
+
+for (Product2 p : toSync) {
+Decimal retail = p.Retail_Price__c.setScale(2, RoundingMode.HALF_UP);
+Decimal wholesale = (retail * (100 - discountPct)).divide(100, 2, RoundingMode.HALF_UP);
+
+plan(p.Id, standardId, retail, p.IsActive, existing, standardInserts, updates);
+plan(p.Id, retailId, retail, p.IsActive && p.Available_for_Retail__c,
+existing, otherInserts, updates);
+plan(p.Id, wholesaleId, wholesale, p.IsActive && p.Available_for_Wholesale__c,
+existing, otherInserts, updates);
+}
+
+// 5. Save. Standard entries must exist before entries in other price books.
+try {
+if (!standardInserts.isEmpty()) {
+Database.insert(standardInserts, AccessLevel.SYSTEM_MODE);
+}
+if (!otherInserts.isEmpty()) {
+Database.insert(otherInserts, AccessLevel.SYSTEM_MODE);
+}
+if (!updates.isEmpty()) {
+Database.update(updates.values(), AccessLevel.SYSTEM_MODE);
+}
+} catch (DmlException e) {
+String fields = (e.getNumDml() > 0) ? String.join(e.getDmlFieldNames(0), ', ') : '';
+for (Product2 p : toSync) {
+p.addError('Price book sync failed: ' + e.getMessage() + ' Fields: ' + fields);
+}
+}
+}
+
+private static void plan(Id productId, Id bookId, Decimal price, Boolean shouldBeActive,
+Map<String, PricebookEntry> existing,
+List<PricebookEntry> inserts,
+Map<Id, PricebookEntry> updates) {
+PricebookEntry pbe = existing.get(key(productId, bookId));
+if (pbe == null) {
+if (shouldBeActive) {
+inserts.add(new PricebookEntry(
+Pricebook2Id = bookId, Product2Id = productId,
+UnitPrice = price, IsActive = true));
+}
+return;
+}
+// Entries are never deleted (old orders may use them); they are deactivated instead.
+// A fresh record carries only the updatable fields.
+if (pbe.UnitPrice != price || pbe.IsActive != shouldBeActive) {
+updates.put(pbe.Id, new PricebookEntry(
+Id = pbe.Id, UnitPrice = price, IsActive = shouldBeActive));
+}
+}
+
+private static String key(Id productId, Id bookId) {
+return productId + '|' + bookId;
+}
+}
