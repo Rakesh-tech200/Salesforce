@@ -1,0 +1,162 @@
+Let me look up that exact error message before I give you a fix.
+You have two separate problems, and both come from my Phase 3 code and instructions.
+The update error: the sync class is the culprit. I can't see from the photo which statement is on line 83, but it's one of the DML lines at the end of handle(). That message is normally raised when a DML statement includes fields that can't be written. The fix below sends only updatable fields and forces system mode.
+"Sometimes no entries on create": this is most likely the Active checkbox. Lightning's New Product form leaves it unticked, and the class only creates entries for active products, silently. The fix below makes that mistake loud and makes any save repair missing entries.
+Step 1: Replace the class
+Developer Console → open ProductPricebookSync → select all → paste this → Ctrl+S:
+public with sharing class ProductPricebookSync {
+
+public static final String RETAIL_BOOK = 'Retail Price Book';
+public static final String WHOLESALE_BOOK = 'Wholesale Price Book';
+
+// Called by ProductTrigger. Every product in the save is re-synced,
+// so a missing entry is repaired the next time the product is saved.
+public static void handle(List<Product2> products) {
+List<Product2> toSync = new List<Product2>();
+for (Product2 p : products) {
+if (p.Retail_Price__c != null) {
+toSync.add(p);
+}
+}
+if (toSync.isEmpty()) {
+return;
+}
+
+List<String> bookNames = new List<String>{ RETAIL_BOOK, WHOLESALE_BOOK };
+Map<String, Id> bookIds = new Map<String, Id>();
+for (Pricebook2 pb : [SELECT Id, Name FROM Pricebook2 WHERE Name IN :bookNames]) {
+bookIds.put(pb.Name, pb.Id);
+}
+if (!bookIds.containsKey(RETAIL_BOOK) || !bookIds.containsKey(WHOLESALE_BOOK)) {
+for (Product2 p : toSync) {
+p.addError('Price books "' + RETAIL_BOOK + '" and "' + WHOLESALE_BOOK
++ '" must exist before products can be saved.');
+}
+return;
+}
+Id retailId = bookIds.get(RETAIL_BOOK);
+Id wholesaleId = bookIds.get(WHOLESALE_BOOK);
+Id standardId = Test.isRunningTest()
+? Test.getStandardPricebookId()
+: [SELECT Id FROM Pricebook2 WHERE IsStandard = true LIMIT 1].Id;
+
+Blush_Setting__mdt setting = Blush_Setting__mdt.getInstance('Default');
+Decimal discountPct = (setting == null) ? 30 : setting.Wholesale_Discount_Pct__c;
+
+Set<Id> productIds = new Map<Id, Product2>(toSync).keySet();
+Set<Id> allBooks = new Set<Id>{ standardId, retailId, wholesaleId };
+Map<String, PricebookEntry> existing = new Map<String, PricebookEntry>();
+for (PricebookEntry e : [
+SELECT Id, Product2Id, Pricebook2Id, UnitPrice, IsActive
+FROM PricebookEntry
+WHERE Product2Id IN :productIds AND Pricebook2Id IN :allBooks
+]) {
+existing.put(key(e.Product2Id, e.Pricebook2Id), e);
+}
+
+List<PricebookEntry> standardInserts = new List<PricebookEntry>();
+List<PricebookEntry> otherInserts = new List<PricebookEntry>();
+Map<Id, PricebookEntry> updates = new Map<Id, PricebookEntry>();
+
+for (Product2 p : toSync) {
+Decimal retail = p.Retail_Price__c.setScale(2, RoundingMode.HALF_UP);
+Decimal wholesale = retail.multiply(100 - discountPct).divide(100, 2, RoundingMode.HALF_UP);
+
+plan(p.Id, standardId, retail, p.IsActive, existing, standardInserts, updates);
+plan(p.Id, retailId, retail, p.IsActive && p.Available_for_Retail__c,
+existing, otherInserts, updates);
+plan(p.Id, wholesaleId, wholesale, p.IsActive && p.Available_for_Wholesale__c,
+existing, otherInserts, updates);
+}
+
+try {
+// Standard entries must exist before entries in other price books
+if (!standardInserts.isEmpty()) {
+Database.insert(standardInserts, AccessLevel.SYSTEM_MODE);
+}
+if (!otherInserts.isEmpty()) {
+Database.insert(otherInserts, AccessLevel.SYSTEM_MODE);
+}
+if (!updates.isEmpty()) {
+Database.update(updates.values(), AccessLevel.SYSTEM_MODE);
+}
+} catch (DmlException e) {
+String fields = (e.getNumDml() > 0) ? String.join(e.getDmlFieldNames(0), ', ') : '';
+for (Product2 p : toSync) {
+p.addError('Price book sync failed: ' + e.getMessage() + ' Fields: ' + fields);
+}
+}
+}
+
+private static void plan(Id productId, Id bookId, Decimal price, Boolean shouldBeActive,
+Map<String, PricebookEntry> existing,
+List<PricebookEntry> inserts,
+Map<Id, PricebookEntry> updates) {
+PricebookEntry pbe = existing.get(key(productId, bookId));
+if (pbe == null) {
+if (shouldBeActive) {
+inserts.add(new PricebookEntry(
+Pricebook2Id = bookId, Product2Id = productId,
+UnitPrice = price, IsActive = true));
+}
+return;
+}
+// Entries are never deleted (old orders may use them); they are deactivated instead.
+// A fresh record carries only the updatable fields.
+if (pbe.UnitPrice != price || pbe.IsActive != shouldBeActive) {
+updates.put(pbe.Id, new PricebookEntry(
+Id = pbe.Id, UnitPrice = price, IsActive = shouldBeActive));
+}
+}
+
+private static String key(Id productId, Id bookId) {
+return productId + '|' + bookId;
+}
+}
+Step 2: Replace the trigger
+Open ProductTrigger, replace everything with:
+trigger ProductTrigger on Product2 (after insert, after update) {
+ProductPricebookSync.handle(Trigger.new);
+}
+Save it. The Problems tab must be empty.
+Step 3: Add a validation rule (makes the Active mistake visible)
+Object Manager → Product → Validation Rules → New:
+Rule Name: Active_Required_For_New_Sellable_Product
+Formula: AND(ISNEW(), NOT(IsActive), OR(Available_for_Retail__c, Available_for_Wholesale__c))
+Message: Tick Active, otherwise no price book entries are created.
+Location: Top of Page, Active ticked
+It only fires on create, so deactivating a product later still works.
+Step 4: Add two tests
+Open ProductPricebookSyncTest. Paste this just before the final closing } of the class:
+@IsTest
+static void saveRepairsMissingEntries() {
+Id stdId = Test.getStandardPricebookId();
+Product2 p = buildProduct('T#011', 1000, true, true);
+insert p;
+delete [SELECT Id FROM PricebookEntry
+WHERE Product2Id = :p.Id AND Pricebook2Id != :stdId];
+Assert.areEqual(1, entriesFor(p.Id).size());
+p.Name = 'Renamed again';
+update p;
+Assert.areEqual(3, entriesFor(p.Id).size());
+}
+
+@IsTest
+static void inactiveNewProductWithChannelIsRejected() {
+Product2 p = buildProduct('T#012', 1000, true, false);
+p.IsActive = false;
+Database.SaveResult sr = Database.insert(p, false);
+Assert.isFalse(sr.isSuccess());
+}
+Save, then Test → New Run → ProductPricebookSyncTest → Run All. Expect 13 passed.
+Step 5: Repair your existing products
+Debug → Open Execute Anonymous Window, paste, tick Open Log off, click Execute:
+List<Product2> all = [SELECT Id FROM Product2
+WHERE Retail_Price__c != null AND Category__c != null];
+update all;
+Then open Retail Price Book → Products (10 active products plus Scarf) and Wholesale Price Book → Products (10; Scarf's entry should show inactive).
+Step 6: Retest by hand
+Create a product with Active ticked and Available for Retail ticked. Its Standard and Retail entries should appear immediately.
+Create one with Active unticked and a channel ticked. You should now get the validation message.
+Edit an existing product's Retail Price. This is the update that failed before.
+If the error comes back, the message will now end with Fields: … and the exact field names. Send me that text, plus how many tests passed, and I'll fix it from there.
