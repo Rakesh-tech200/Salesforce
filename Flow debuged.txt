@@ -1,0 +1,34 @@
+Before-save flows can't read formula fields on a parent record, and Intra_State__c is a formula on Order. That is why only the three tax-split formulas failed (the one you called flgst is fIgst). The fix is to read the Order with a Get Records element and work out intra-state inside the flow. Your other formulas passed, so they're fine.
+Step 1: Add a Get Records element
+On the flow canvas, click the + on the line after Get Setting and choose Get Records.
+Set:
+Label: Get Order
+Object: Order
+Filter: Order ID Equals {!$Record.OrderId}
+How many records: Only the first record
+Store: Automatically store all fields
+Click Done.
+Step 2: Add one new formula
++ → New Resource → Formula:
+API Name: fIntra
+Data Type: Boolean
+Formula:
+OR(
+  UPPER(TRIM({!Get_Order.BillingState})) = UPPER({!Get_Setting.Home_State__c}),
+  UPPER(TRIM({!Get_Order.BillingState})) = "MH"
+)
+The editor converts spaces in element names into underscores. If it doesn't accept my text, use the Insert a resource picker and choose Get Order > Billing State and Get Setting > Home State.
+Step 3: Edit the three failing formulas
+Open each one, replace the formula and click Done:
+fCgst (Number, 2 decimals)
+IF({!fIntra}, ROUND({!fGstAmt} / 2, 2), 0)
+fSgst (Number, 2 decimals)
+IF({!fIntra}, {!fGstAmt} - {!fCgst}, 0)
+fIgst (Number, 2 decimals)
+IF({!fIntra}, 0, {!fGstAmt})
+Step 4: Check the order of elements
+On the canvas the flow must run in this order: Start → Get Setting → Get Order → Set Line Values. Drag the connectors if Get Order isn't before the assignment.
+Step 5: Save and activate
+Click Save, using the same Label (Blush - Order Product - Calculate) and API Name (Blush_OrderItem_Calculate), then Activate.
+Then continue with Step 5.5 onward. The expected numbers in Step 5.7 don't change, including the Gujarat check, where Flow 3 re-saves the lines and Total IGST must become 330.
+If Save shows any new error, send me the formula name and the exact message.
