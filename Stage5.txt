@@ -1,0 +1,387 @@
+Phase 5: Flows, validation rules and the approval process
+Build order: the approval formula → validation rules → four small flows → test them → Create Order flow → approval process → final tests.
+For every flow: Setup → Flows → New Flow. Save it with the exact Label and API Name I give, then click Activate.
+Click + on the canvas to add an element. Name each element with the Label I give. The API name auto-fills, and you must keep it.
+My formulas assume the Paid status API value is Paid. If yours differs, tell me before you start.
+Step 5.1: Order formula "Needs Approval"
+Object Manager → Order → Fields & Relationships → New → Formula → Next.
+Label: Needs Approval, Name: Needs_Approval, Return type: Checkbox. Click Next.
+Formula:
+Max_Discount__c > MAX($CustomMetadata.Blush_Setting__mdt.Default.Approval_Discount_Limit_Pct__c, Approved_Max_Discount__c)
+Check Syntax → Next → Next → Save.
+Open Retail Order Layout and Wholesale Order Layout. Drag Needs Approval into the Totals and Commission section and set it Read-Only (wrench icon). Save each layout.
+It is true only when a line's discount is above the 10% limit and above the level already approved.
+Step 5.2: Validation rules
+For each rule: Object Manager → [object] → Validation Rules → New. Tick Active. Paste the formula and enter the message. Error Location is Top of Page unless I say otherwise.
+Opportunity (4 rules)
+Customer_Name_Required: Location: field Customer Name
+AND(OR(ISNEW(), ISCHANGED(Customer_Name__c)), ISBLANK(Customer_Name__c))
+Message: Customer Name is required.
+Customer_Email_Or_Phone_Required
+AND(ISNEW(), ISBLANK(Customer_Email__c), ISBLANK(Customer_Phone__c))
+Message: Enter at least one of Customer Email or Customer Phone.
+Pricebook_Must_Match_Record_Type
+AND(
+  NOT(ISBLANK(Pricebook2Id)),
+  OR(
+    AND(RecordType.DeveloperName = "Retail", Pricebook2.Name <> "Retail Price Book"),
+    AND(RecordType.DeveloperName = "Wholesale", Pricebook2.Name <> "Wholesale Price Book")
+  )
+)
+Message: Retail opportunities must use the Retail Price Book and wholesale ones the Wholesale Price Book.
+Account_Record_Type_Must_Match
+AND(NOT(ISBLANK(AccountId)), Account.RecordType.DeveloperName <> RecordType.DeveloperName)
+Message: The Account's record type must match the Opportunity's record type.
+If the syntax check rejects Pricebook2.Name, use Insert Field → Price Book → Price Book Name instead and tell me what it inserted.
+Order (7 rules)
+Account_Record_Type_Must_Match_Order
+AND(NOT(ISBLANK(AccountId)), Account.RecordType.DeveloperName <> RecordType.DeveloperName)
+Message: The Account's record type must match the Order's record type.
+Pricebook_Must_Match_Order_Record_Type
+AND(
+  NOT(ISBLANK(Pricebook2Id)),
+  OR(
+    AND(RecordType.DeveloperName = "Retail", Pricebook2.Name <> "Retail Price Book"),
+    AND(RecordType.DeveloperName = "Wholesale", Pricebook2.Name <> "Wholesale Price Book")
+  )
+)
+Message: Price book does not match the order's record type.
+Store_Required_To_Confirm: Location: field Store
+AND(OR(ISPICKVAL(Status,"Confirmed"), ISPICKVAL(Status,"Paid")), ISBLANK(Store__c))
+Message: Select a Store before confirming or paying the order.
+Payment_Mode_Required_To_Confirm: Location: field Payment Mode
+AND(OR(ISPICKVAL(Status,"Confirmed"), ISPICKVAL(Status,"Paid")), ISPICKVAL(Payment_Mode__c, ""))
+Message: Select a Payment Mode before confirming or paying the order.
+Billing_State_Required_To_Confirm
+AND(OR(ISPICKVAL(Status,"Confirmed"), ISPICKVAL(Status,"Paid")), ISBLANK(BillingState))
+Message: Enter the Billing State before confirming or paying the order (it decides CGST/SGST vs IGST).
+Lines_Required_To_Confirm
+AND(OR(ISPICKVAL(Status,"Confirmed"), ISPICKVAL(Status,"Paid")), Line_Count__c = 0)
+Message: Add at least one product before confirming or paying the order.
+Discount_Approval_Required
+AND(OR(ISPICKVAL(Status,"Confirmed"), ISPICKVAL(Status,"Paid")), Needs_Approval__c)
+Message: A line discount is above the approval limit. Submit the order for manager approval first.
+Order Product (3 rules)
+Unit_Price_Must_Equal_List_Price
+AND(NOT(ISBLANK(ListPrice)), UnitPrice <> ListPrice)
+Message: Unit Price comes from the price book. Use Discount % to give a discount.
+Discount_Between_0_And_100: Location: field Discount %
+OR(Discount_Percent__c < 0, Discount_Percent__c > 100)
+Message: Discount % must be between 0 and 100.
+Quantity_Whole_Number: Location: field Quantity
+OR(Quantity < 1, Quantity <> FLOOR(Quantity))
+Message: Quantity must be a whole number of at least 1.
+Step 5.3: Flow 1, Opportunity default price book
+New Flow → Record-Triggered Flow → Create.
+Configure the Start element:
+Object: Opportunity
+Trigger: A record is created
+Entry conditions: Custom Condition Logic Is Met → All Conditions Are Met (AND) with Pricebook ID Is Null = True
+Optimize the Flow for: Fast Field Updates
+Add Formula resource (+ → New Resource → Formula): API Name fBookName, Data Type Text, formula:
+IF({!$Record.RecordType.DeveloperName} = "Wholesale", "Wholesale Price Book", "Retail Price Book")
++ → Get Records: Label Get Pricebook. Object: Price Book. Filter: Name Equals {!fBookName}. Store: Only the first record. Fields: Automatically store all fields.
++ → Assignment: Label Set Pricebook. Variable {!$Record.Pricebook2Id} Equals {!Get Pricebook.Id}.
+Save: Label Blush - Opportunity - Default Price Book, API Name Blush_Opp_Default_Pricebook. Activate.
+Now make the price book visible: add Price Book to Retail Opportunity Layout and Wholesale Opportunity Layout (drag from the palette, Save).
+Test: create a Retail Opportunity. Set Customer Name Test One, Customer Email t1@example.com, Account Test Retail Customer. After saving, Price Book must show Retail Price Book. A Wholesale Opportunity (Account Test Wholesale Co) must show Wholesale Price Book. Also check that saving a Retail Opportunity with a blank Customer Name gives the error. Keep the Retail test opportunity for later.
+Step 5.4: Flow 2, Order Product calculations
+New Flow → Record-Triggered Flow. Object: Order Product. Trigger: A record is created or updated. Entry conditions: None (always run). Run: Every time a record is updated and meets the condition requirements. Optimize for: Fast Field Updates.
++ → Get Records: Label Get Setting. Object: Blush Setting. Filter: Developer Name Equals Default. Store: Only the first record. Fields: all.
+Create these Formula resources. Each is Data Type: Number, Decimal Places: 2.
+API Name
+Formula
+fDiscountAmt
+ROUND({!$Record.UnitPrice} * BLANKVALUE({!$Record.Discount_Percent__c}, 0) / 100, 2)
+fDiscountedUnit
+{!$Record.UnitPrice} - {!fDiscountAmt}
+fTaxable
+ROUND({!fDiscountedUnit} * {!$Record.Quantity}, 2)
+fGstRate
+IF({!$Record.PricebookEntry.Product2.Category__c} = "Jewellery", {!Get Setting.Jewellery_GST_Pct__c}, IF({!fDiscountedUnit} > {!Get Setting.Garment_GST_Threshold__c}, {!Get Setting.Garment_GST_High_Pct__c}, {!Get Setting.Garment_GST_Low_Pct__c}))
+fGstAmt
+ROUND({!fTaxable} * {!fGstRate} / 100, 2)
+fCgst
+IF({!$Record.Order.Intra_State__c}, ROUND({!fGstAmt} / 2, 2), 0)
+fSgst
+IF({!$Record.Order.Intra_State__c}, {!fGstAmt} - {!fCgst}, 0)
+fIgst
+IF({!$Record.Order.Intra_State__c}, 0, {!fGstAmt})
+fNet
+{!fTaxable} + {!fGstAmt}
+fCost
+ROUND({!$Record.PricebookEntry.Product2.Cost_Price__c} * {!$Record.Quantity}, 2)
+In the editor, $Record.PricebookEntry.Product2.Category__c is the picker path $Record → Price Book Entry ID → Product ID → Category. Use the picker if typing is rejected.
++ → Assignment: Label Set Line Values. Add these ten rows (variable Equals value):
+Variable
+Value
+{!$Record.Discount_Amount__c}
+{!fDiscountAmt}
+{!$Record.Taxable_Amount__c}
+{!fTaxable}
+{!$Record.GST_Rate__c}
+{!fGstRate}
+{!$Record.GST_Amount__c}
+{!fGstAmt}
+{!$Record.CGST_Amount__c}
+{!fCgst}
+{!$Record.SGST_Amount__c}
+{!fSgst}
+{!$Record.IGST_Amount__c}
+{!fIgst}
+{!$Record.Net_Price__c}
+{!fNet}
+{!$Record.Cost_Amount__c}
+{!fCost}
+Save: Label Blush - Order Product - Calculate, API Name Blush_OrderItem_Calculate. Activate.
+If the traversal through PricebookEntry.Product2 is rejected, tell me. I'll switch you to two Get Records elements instead.
+Step 5.5: Flow 3, recalculate lines when Billing State changes
+New Flow → Record-Triggered Flow. Object: Order. Trigger: A record is updated. Entry conditions: Formula Evaluates to True:
+{!$Record.BillingState} <> {!$Record__Prior.BillingState}
+Optimize for: Actions and Related Records.
+2. + → Get Records: Label Get Lines. Object: Order Product. Filter: Order ID Equals {!$Record.Id}. Store: All records. Fields: all.
+3. + → Decision: Label Has Lines. Outcome label Yes: {!Get Lines} Is Empty = False. Default outcome: No (leave unconnected).
+4. On the Yes path, + → Update Records: Label Resave Lines. How to Find Records: Use the IDs and all field values from a record collection. Record Collection: {!Get Lines}.
+5. Save: Label Blush - Order - Recalculate Lines On State Change, API Name Blush_Order_Recalc_Lines. Activate.
+Step 5.6: Flow 4, freeze commission when Paid
+New Flow → Record-Triggered Flow. Object: Order. Trigger: A record is updated. Entry conditions: All Conditions Are Met (AND): Status Equals Paid. Run: Only when a record is updated to meet the condition requirements. Optimize for: Fast Field Updates.
++ → Assignment: Label Freeze Commission. Variable {!$Record.Commission_Amount__c} Equals {!$Record.Commission_Calculated__c}.
+Save: Label Blush - Order - Freeze Commission, API Name Blush_Order_Freeze_Commission. Activate.
+Step 5.7: Test flows 1–4 with a manual order
+Orders → New → Retail: Account Test Retail Customer, Order Date today, Price Book Retail Price Book, Billing State Maharashtra. Save.
+Related → Order Products → Add Products: Jeans (10#025) qty 2, Earrings (14#004) qty 1.
+Open the Jeans Order Product → Edit → Discount % = 10 → Save.
+Check the Order totals:
+Field
+Expected
+Effective Amount
+2,900.00
+Total CGST / SGST / IGST
+165.00 / 165.00 / 0.00
+Total GST
+330.00
+Total Payable
+3,230.00
+Max Discount %
+10
+Needs Approval
+unchecked
+Commission Calculated
+30.00 (effective amount is above 1,000)
+Total Cost / Gross Profit
+1,600.00 / 1,300.00
+Jeans line: Discount Amount 150, Taxable 2,700, GST Rate 12, GST 324, Net 3,024. Earrings line: Taxable 200, GST Rate 3, GST 6, Net 206.
+5. Change the Order's Billing State to Gujarat and save. Without touching the lines, Total IGST must become 330, with CGST and SGST both 0. This is Flow 3 at work.
+6. Set Billing State back to Maharashtra.
+7. Edit the Jeans line: Discount % 12.5. Max Discount % becomes 12.5 and Needs Approval becomes checked. Then set Store = Blush - Pune, Payment Mode = Cash and try Status = Confirmed. You should get the discount approval error. Set Discount % back to 10.
+8. Now change Status to Confirmed, then to Paid. Check Commission Amount equals Commission Calculated (30.00).
+9. Boundary checks on new Draft orders (Retail, Maharashtra):
+Tshirt (11#122) qty 2: Effective 1,000 → Commission Calculated 10.00
+Add one more Tshirt line (qty 1): Effective 1,500 → 30.00
+Earrings (14#004) qty 1 alone: Effective 200 → 2.00
+Top (10#026) qty 1, no discount: GST Rate 5 (the price is exactly 1,000, not above it)
+Order Product rules: try changing Unit Price, Discount % = 150 and Quantity = 1.5. Each must be rejected.
+Tell me if any number differs before moving on.
+Step 5.8: Flow 5, Create Order screen flow
+Start: New Flow → Screen Flow → Create. First create the resources below, then the elements.
+Resources (+ → New Resource)
+Type
+API Name
+Settings
+Variable
+recordId
+Data Type Text; tick Available for input
+Variable
+varOrder
+Data Type Record; Object Order
+Variable
+varItem
+Data Type Record; Object Order Product
+Variable
+colItems
+Data Type Record; Object Order Product; tick Allow multiple values (collection)
+Record Choice Set
+rcStores
+Object Store; Condition Active Equals True; Sort by Store Name ascending; Display field Store Name; Value field Record ID
+Picklist Choice Set
+pcPayment
+Object Order; Field Payment Mode
+Formula (Text)
+fCountry
+BLANKVALUE({!Get Account.BillingCountry}, "India")
+Formula (Number, 2dp)
+fLineDiscount
+BLANKVALUE({!Loop Lines.Discount}, 0)
+You'll create Get Account and Loop Lines below. If the formula editor complains they don't exist yet, create fCountry and fLineDiscount after those elements exist.
+Elements, in this order
+Get Records Get Opp: Object Opportunity, Id Equals {!recordId}, first record only, all fields.
+Get Records Get Lines: Object Opportunity Product, Opportunity ID Equals {!recordId}, All records, all fields.
+Decision Check Opportunity, with outcomes in this order:
+No Account: {!Get Opp.AccountId} Is Null True
+Already Ordered: {!Get Opp.Order_Created__c} Equals True
+No Products: {!Get Lines} Is Empty True
+Default outcome label: OK
+Three Screen elements, one per stop outcome. Each has a single Display Text and no Back/Cancel:
+Stop No Account: This opportunity has no customer account yet. Save it so the account is created, then try again.
+Stop Already Ordered: An order has already been created for this opportunity.
+Stop No Products: Add products to the opportunity first, then create the order.
+On the OK path: Get Records Get Account: Object Account, Id Equals {!Get Opp.AccountId}, first record, all fields.
+Get Records Get Opp RT: Object Record Type, Record Type ID Equals {!Get Opp.RecordTypeId}, first record, fields Id and DeveloperName.
+Get Records Get Order RT: Object Record Type. Conditions (AND): SObject Type Name Equals Order and Developer Name Equals {!Get Opp RT.DeveloperName}. First record, fields Id and DeveloperName.
+Screen Scr OrderDetails. Add these components (select a component type in the left palette and set the API Name exactly):
+Component
+API Name
+Label
+Settings
+Dropdown (Choice)
+Store
+Store
+Required; choice rcStores
+Picklist
+PaymentMode
+Payment Mode
+Choice pcPayment; not required
+Date
+OrderDate
+Order Date
+Required; Default {!$Flow.CurrentDate}
+Text
+BillStreet
+Billing Street
+Default {!Get Account.BillingStreet}
+Text
+BillCity
+Billing City
+Default {!Get Account.BillingCity}
+Text
+BillState
+Billing State
+Required; Default {!Get Account.BillingState}
+Text
+BillPostal
+Billing Postal Code
+Default {!Get Account.BillingPostalCode}
+Text
+BillCountry
+Billing Country
+Default {!fCountry}
+Also add a Display Text at the top: Review the details and click Next to create the order.
+9. Assignment Set Order Values on varOrder. Add these rows:
+Variable
+Value
+{!varOrder.AccountId}
+{!Get Opp.AccountId}
+{!varOrder.RecordTypeId}
+{!Get Order RT.Id}
+{!varOrder.Pricebook2Id}
+{!Get Opp.Pricebook2Id}
+{!varOrder.EffectiveDate}
+{!Scr OrderDetails.OrderDate}
+{!varOrder.Status}
+Draft (typed text)
+{!varOrder.Store__c}
+{!Scr OrderDetails.Store}
+{!varOrder.Payment_Mode__c}
+{!Scr OrderDetails.PaymentMode}
+{!varOrder.Sales_Representative__c}
+{!Get Opp.OwnerId}
+{!varOrder.Source_Opportunity__c}
+{!recordId}
+{!varOrder.BillingStreet}
+{!Scr OrderDetails.BillStreet}
+{!varOrder.BillingCity}
+{!Scr OrderDetails.BillCity}
+{!varOrder.BillingState}
+{!Scr OrderDetails.BillState}
+{!varOrder.BillingPostalCode}
+{!Scr OrderDetails.BillPostal}
+{!varOrder.BillingCountry}
+{!Scr OrderDetails.BillCountry}
+Create Records Create Order: How many: One. Set fields from: Use all values from a record variable → varOrder.
+Loop Loop Lines: Collection Variable {!Get Lines}, direction First item to last item.
+Inside the loop (the "For Each" path): Assignment Build Item with these rows:
+Variable
+Operator
+Value
+{!varItem.OrderId}
+Equals
+{!varOrder.Id}
+{!varItem.PricebookEntryId}
+Equals
+{!Loop Lines.PricebookEntryId}
+{!varItem.Quantity}
+Equals
+{!Loop Lines.Quantity}
+{!varItem.UnitPrice}
+Equals
+{!Loop Lines.ListPrice}
+{!varItem.Discount_Percent__c}
+Equals
+{!fLineDiscount}
+{!colItems}
+Add
+{!varItem}
+- Connect `Build Item` back to the loop element.
+- The `UnitPrice` row uses **List Price**, not the discounted Sales Price. That is what prevents a double discount.
+After the loop (the "After Last Item" path): Create Records Create Items: Set fields from: Use all values from a record collection → colItems.
+Update Records Update Opportunity: Specify conditions: Opportunity ID Equals {!recordId}. Set fields: Order_Created__c = {!$GlobalConstant.True}; StageName = Closed Won.
+Get Records Get New Order: Object Order, Order ID Equals {!varOrder.Id}, first record, all fields.
+Screen Scr Done (with Finish button): Display Text: Order {!Get New Order.OrderNumber} created. Total payable: Rs. {!Get New Order.Total_Payable__c}. Open it from the Blush Orders list on this opportunity.
+Save: Label Blush - Create Order From Opportunity, API Name Blush_Create_Order. Activate.
+I've added no fault paths on purpose. If any step fails, Salesforce rolls the whole run back and shows the error, so you never get half-created orders.
+Quick action and layouts
+Object Manager → Opportunity → Buttons, Links, and Actions → New Action.
+Action Type: Flow. Flow: Blush - Create Order From Opportunity. Label: Create Order. Name: Create_Order. Save.
+Open Retail Opportunity Layout and Wholesale Opportunity Layout. In Salesforce Mobile and Lightning Experience Actions, drag Create Order in (click override the predefined actions first if needed). In Related Lists, drag in Blush Orders. Save each.
+Also make Order Created read-only on both layouts (wrench icon).
+Step 5.9: Test the Create Order flow
+Test A: Retail
+Create a Retail Opportunity: Customer Name Flow Test Retail, Email ft1@example.com, Account Test Retail Customer, any Close Date, Stage Prospecting. Check the Price Book shows Retail Price Book.
+Related → Products → Add Products: Jeans qty 2 with Discount 10, Earrings (14#004) qty 1.
+Click Create Order. Choose Store = Blush - Pune, Payment Mode = UPI, Billing State = Maharashtra. Click Next.
+Open the new Order. It must show the same totals as Step 5.7 (Effective 2,900, GST 330, Total Payable 3,230), Sales Representative = you, Source Opportunity = your opportunity and Status = Draft.
+The Opportunity must show Order Created checked and Stage Closed Won. Clicking Create Order again must show already created.
+Test B: Wholesale
+Create a Wholesale Opportunity: Customer Name Flow Test Wholesale, Account Test Wholesale Co.
+Add Jeans qty 3, discount 0. Create the Order with Billing State Karnataka.
+Expected: Unit price 1,050, GST Rate 12, GST 378.00, IGST 378, CGST and SGST 0, Total Payable 3,528.00.
+Test C: Stops
+Create an Opportunity with no Account and click Create Order: you should see the no customer account screen.
+Use one with no products: you should see the add products first screen.
+Step 5.10: Approval process
+Setup → Approval Processes. Under Manage Approval Processes For, choose Order.
+Create New Approval Process → Use Standard Setup Wizard.
+Step 1: Name Discount Approval, Unique Name Discount_Approval. Next.
+Step 2, Entry criteria: Criteria are met: Needs Approval equals True. Next.
+Step 3, Approver: select Automatically assign using the user field, with Manager as the field. Record Editability: Administrators OR the currently assigned approver can edit records. Next.
+Step 4, Notification template: leave blank. Next.
+Step 5, Initial submitters: keep Order Owner. Save.
+When asked, click Yes, I'd like to create an approval step now → Go.
+Step: Name Manager Approval, Unique Name Manager_Approval. Step criteria: All records should enter this step. Approver: Automatically assign using the user field Manager. If the user rejects: Final Rejection. Save.
+On the process page, under Final Approval Actions, click Add New → Field Update:
+Name: Record Approved Discount
+Field to Update: Approved Max Discount %
+Specify New Field Value: Use a formula to set the new value, formula: Max_Discount__c
+Save → Done
+Click Activate.
+Add the Submit button to the Order layouts
+For both Retail Order Layout and Wholesale Order Layout, in Salesforce Mobile and Lightning Experience Actions, drag Submit for Approval in (click override the predefined actions first if needed). Save.
+Test (limited for now)
+Open a Draft Order and set a line's Discount % to 12.5. Needs Approval becomes checked.
+Click Submit for Approval. You should get an error about a missing manager or approver. That is the expected result for now, because your admin user has no Manager. It proves the entry criteria matched and routing was attempted.
+Set the discount back to 10.
+The full approval test (submit, approve, then confirm) happens in Phase 10, once the Sales user exists with the admin as their Manager.
+Phase 5 checkpoint
+[ ] Needs Approval formula created and on both Order layouts
+[ ] 4 Opportunity, 7 Order and 3 Order Product validation rules are active
+[ ] 5 flows are active: Blush_Opp_Default_Pricebook, Blush_OrderItem_Calculate, Blush_Order_Recalc_Lines, Blush_Order_Freeze_Commission, Blush_Create_Order
+[ ] Manual order totals match the Step 5.7 table, and the Gujarat switch gave IGST 330
+[ ] The discount gate blocks Confirmed, and Commission Amount froze at Paid
+[ ] Boundary commissions are 10.00, 30.00 and 2.00; Top 1000 is GST Rate 5
+[ ] Create Order works for Retail and Wholesale and shows the stop screens
+[ ] Approval process is active; Submit for Approval is on both Order layouts and fails with the missing-manager error
+Tell me anything that differed, especially:
+the Step 5.7 totals
+any formula or traversal the editors rejected (PricebookEntry.Product2, Pricebook2.Name)
+the Flow Builder screen where you got stuck
+Reply next for Phase 6: the Opportunity Apex trigger (lead matching and conversion) with its test class.
