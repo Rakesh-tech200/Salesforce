@@ -1,0 +1,49 @@
+Same cause as before. Before-save flows can't read formula fields on the record, and Commission_Calculated__c is a formula. Switching the flow to after-save isn't the answer either, because it would then try to edit an order that has just become Paid, and the Paid lock could block that for Sales users. So the flow will calculate the commission itself by adding up the order's line amounts, then store the result in the same save.
+Open the flow Blush - Order - Freeze Commission in Flow Builder. Keep the Start element as it is (Order, record updated, Status Equals Paid, only when updated to meet the conditions, Fast Field Updates).
+Step 1: Delete the old element
+Delete the Assignment Freeze Commission (the one referencing Commission_Calculated__c). Click it, then Delete.
+Step 2: Add two resources
++ → New Resource
+Type
+API Name
+Settings
+Variable
+vEffective
+Data Type Number, Decimal Places 2, Default Value 0
+Formula
+fCommission
+Data Type Number, Decimal Places 2, formula below
+IF({!vEffective} = 0, 0,
+IF({!vEffective} <= {!Get_Setting.Commission_Threshold__c},
+ROUND({!vEffective} * {!Get_Setting.Commission_Pct__c} / 100, 2),
+{!Get_Setting.Commission_Flat__c}))
+If Get_Setting isn't recognised yet, create the formula after Step 3. If the editor rejects the typed text, use the Insert a resource picker for the three Get Setting fields.
+Step 3: Add the elements
+Build them in this order between Start and the end:
+Get Records
+Label: Get Setting
+Object: Blush Setting
+Filter: Developer Name Equals Default
+Store: Only the first record; all fields
+Get Records
+Label: Get Lines
+Object: Order Product
+Filter: Order ID Equals {!$Record.Id}
+Store: All records; all fields
+Loop
+Label: Loop Lines
+Collection Variable: {!Get Lines}
+Direction: First item to last item
+On the For Each Item path, add an Assignment
+Label: Add Taxable
+Variable: {!vEffective} Add {!Loop Lines.Taxable_Amount__c}
+Connect Add Taxable back to Loop Lines.
+On the After Last Item path, add an Assignment
+Label: Freeze Commission
+Variable: {!$Record.Commission_Amount__c} Equals {!fCommission}
+The canvas order is: Start → Get Setting → Get Lines → Loop Lines → (For Each) Add Taxable → back to Loop Lines; (After Last) Freeze Commission.
+Step 4: Save and activate
+Save with the same Label (Blush - Order - Freeze Commission) and API Name (Blush_Order_Freeze_Commission), then Activate. If Salesforce asks, save it as a new version.
+Test (same as Step 5.7)
+On the order with Jeans (2, 10% discount) and Earrings (1), set Store, Payment Mode and Billing State, then Confirmed, then Paid. Commission Amount must equal Commission Calculated (30.00). Try one more Draft order whose lines add up to a taxable total of exactly 1,000 (for example Tshirt × 2). Its Commission Amount at Paid must be 10.00.
+If Save shows any other error, send me the element name and the exact message. Then continue with Step 5.7.
