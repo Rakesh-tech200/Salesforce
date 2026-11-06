@@ -1,0 +1,440 @@
+Switch the availability checkboxes to a picklist
+Design. One picklist replaces both checkboxes:
+Available For
+Retail price book
+Wholesale price book
+Retail
+active
+inactive
+Wholesale
+inactive
+active
+Both
+active
+active
+(blank)
+inactive
+inactive
+The price book behaviour stays exactly as before. Only the field the Apex reads changes. Do the steps in this order, because Salesforce won't let you delete the old fields while code still uses them.
+Step 1: Create the picklist
+Setup → Object Manager → Product → Fields & Relationships → New → Picklist → Next.
+Field Label: Available For, Field Name: Available_For.
+Values (one per line): Retail, Wholesale, Both. Leave Required unticked and Use first value as default unticked.
+Next → Next → Save. (Keep it on the Product Layout.)
+Step 2: Copy the existing data across
+Developer Console → Debug → Open Execute Anonymous Window. Untick Open Log, paste and Execute:
+List<Product2> ps = [SELECT Id, Available_for_Retail__c, Available_for_Wholesale__c
+                     FROM Product2
+                     WHERE Retail_Price__c != null AND Category__c != null];
+for (Product2 p : ps) {
+    if (p.Available_for_Retail__c && p.Available_for_Wholesale__c) {
+        p.Available_For__c = 'Both';
+    } else if (p.Available_for_Retail__c) {
+        p.Available_For__c = 'Retail';
+    } else if (p.Available_for_Wholesale__c) {
+        p.Available_For__c = 'Wholesale';
+    }
+}
+update ps;
+Check with the Query Editor:
+SELECT Name, ProductCode, Available_For__c FROM Product2 WHERE Available_For__c != null ORDER BY ProductCode
+Expect 10 products with Both, and Scarf (99#001) with Retail.
+Step 3: Replace the class ProductPricebookSync
+Open it, select all, paste, Ctrl+S:
+public with sharing class ProductPricebookSync {
+
+
+    public static final String RETAIL_BOOK = 'Retail Price Book';
+    public static final String WHOLESALE_BOOK = 'Wholesale Price Book';
+
+
+    // Called by ProductTrigger. Every product in the save is re-synced,
+    // so a missing entry is repaired the next time the product is saved.
+    public static void handle(List<Product2> products) {
+        List<Product2> toSync = new List<Product2>();
+        for (Product2 p : products) {
+            if (p.Retail_Price__c != null) {
+                toSync.add(p);
+            }
+        }
+        if (toSync.isEmpty()) {
+            return;
+        }
+
+
+        // 1. Find the two custom price books by name
+        List<String> bookNames = new List<String>{ RETAIL_BOOK, WHOLESALE_BOOK };
+        Map<String, Id> bookIds = new Map<String, Id>();
+        for (Pricebook2 pb : [SELECT Id, Name FROM Pricebook2 WHERE Name IN :bookNames]) {
+            bookIds.put(pb.Name, pb.Id);
+        }
+        if (!bookIds.containsKey(RETAIL_BOOK) || !bookIds.containsKey(WHOLESALE_BOOK)) {
+            for (Product2 p : toSync) {
+                p.addError('Price books "' + RETAIL_BOOK + '" and "' + WHOLESALE_BOOK
+                    + '" must exist before products can be saved.');
+            }
+            return;
+        }
+        Id retailId = bookIds.get(RETAIL_BOOK);
+        Id wholesaleId = bookIds.get(WHOLESALE_BOOK);
+        // Tests cannot query the standard price book, so they use the Test method.
+        Id standardId = Test.isRunningTest()
+            ? Test.getStandardPricebookId()
+            : [SELECT Id FROM Pricebook2 WHERE IsStandard = true LIMIT 1].Id;
+
+
+        // 2. Wholesale discount % comes from the Blush Setting record (falls back to 30)
+        Blush_Setting__mdt setting = Blush_Setting__mdt.getInstance('Default');
+        Decimal discountPct = (setting == null) ? 30 : setting.Wholesale_Discount_Pct__c;
+
+
+        // 3. Load the entries that already exist for these products
+        Set<Id> productIds = new Map<Id, Product2>(toSync).keySet();
+        Set<Id> allBooks = new Set<Id>{ standardId, retailId, wholesaleId };
+        Map<String, PricebookEntry> existing = new Map<String, PricebookEntry>();
+        for (PricebookEntry e : [
+            SELECT Id, Product2Id, Pricebook2Id, UnitPrice, IsActive
+            FROM PricebookEntry
+            WHERE Product2Id IN :productIds AND Pricebook2Id IN :allBooks
+        ]) {
+            existing.put(key(e.Product2Id, e.Pricebook2Id), e);
+        }
+
+
+        // 4. Decide what to insert and what to update
+        List<PricebookEntry> standardInserts = new List<PricebookEntry>();
+        List<PricebookEntry> otherInserts = new List<PricebookEntry>();
+        Map<Id, PricebookEntry> updates = new Map<Id, PricebookEntry>();
+
+
+        for (Product2 p : toSync) {
+            Decimal retail = p.Retail_Price__c.setScale(2, RoundingMode.HALF_UP);
+            Decimal wholesale = (retail * (100 - discountPct)).divide(100, 2, RoundingMode.HALF_UP);
+
+
+            // The "Available For" picklist decides which channels sell this product
+            Boolean forRetail = (p.Available_For__c == 'Retail' || p.Available_For__c == 'Both');
+            Boolean forWholesale = (p.Available_For__c == 'Wholesale' || p.Available_For__c == 'Both');
+
+
+            plan(p.Id, standardId, retail, p.IsActive, existing, standardInserts, updates);
+            plan(p.Id, retailId, retail, p.IsActive && forRetail,
+                existing, otherInserts, updates);
+            plan(p.Id, wholesaleId, wholesale, p.IsActive && forWholesale,
+                existing, otherInserts, updates);
+        }
+
+
+        // 5. Save. Standard entries must exist before entries in other price books.
+        try {
+            if (!standardInserts.isEmpty()) {
+                Database.insert(standardInserts, AccessLevel.SYSTEM_MODE);
+            }
+            if (!otherInserts.isEmpty()) {
+                Database.insert(otherInserts, AccessLevel.SYSTEM_MODE);
+            }
+            if (!updates.isEmpty()) {
+                Database.update(updates.values(), AccessLevel.SYSTEM_MODE);
+            }
+        } catch (DmlException e) {
+            String fields = (e.getNumDml() > 0) ? String.join(e.getDmlFieldNames(0), ', ') : '';
+            for (Product2 p : toSync) {
+                p.addError('Price book sync failed: ' + e.getMessage() + ' Fields: ' + fields);
+            }
+        }
+    }
+
+
+    private static void plan(Id productId, Id bookId, Decimal price, Boolean shouldBeActive,
+                             Map<String, PricebookEntry> existing,
+                             List<PricebookEntry> inserts,
+                             Map<Id, PricebookEntry> updates) {
+        PricebookEntry pbe = existing.get(key(productId, bookId));
+        if (pbe == null) {
+            if (shouldBeActive) {
+                inserts.add(new PricebookEntry(
+                    Pricebook2Id = bookId, Product2Id = productId,
+                    UnitPrice = price, IsActive = true));
+            }
+            return;
+        }
+        // Entries are never deleted (old orders may use them); they are deactivated instead.
+        // A fresh record carries only the updatable fields.
+        if (pbe.UnitPrice != price || pbe.IsActive != shouldBeActive) {
+            updates.put(pbe.Id, new PricebookEntry(
+                Id = pbe.Id, UnitPrice = price, IsActive = shouldBeActive));
+        }
+    }
+
+
+    private static String key(Id productId, Id bookId) {
+        return productId + '|' + bookId;
+    }
+}
+ProductTrigger stays exactly as it is.
+Step 4: Update the two test classes
+4a. Replace ProductPricebookSyncTest (select all, paste, Ctrl+S):
+@IsTest
+private class ProductPricebookSyncTest {
+
+
+    @TestSetup
+    static void setup() {
+        insert new List<Pricebook2>{
+            new Pricebook2(Name = ProductPricebookSync.RETAIL_BOOK, IsActive = true),
+            new Pricebook2(Name = ProductPricebookSync.WHOLESALE_BOOK, IsActive = true)
+        };
+    }
+
+
+    // channel: 'Retail', 'Wholesale', 'Both' or null
+    private static Product2 buildProduct(String code, Decimal retail, String channel) {
+        return new Product2(
+            Name = 'Test ' + code, ProductCode = code, Category__c = 'Garments',
+            Cost_Price__c = retail / 2, Retail_Price__c = retail,
+            Available_For__c = channel, IsActive = true);
+    }
+
+
+    // Expected wholesale price using the same setting the trigger reads
+    private static Decimal wholesaleOf(Decimal retail) {
+        Decimal pct = Blush_Setting__mdt.getInstance('Default').Wholesale_Discount_Pct__c;
+        return (retail * (100 - pct)).divide(100, 2, RoundingMode.HALF_UP);
+    }
+
+
+    // Returns entries keyed 'Standard', 'Retail' or 'Wholesale'
+    private static Map<String, PricebookEntry> entriesFor(Id productId) {
+        Map<String, PricebookEntry> result = new Map<String, PricebookEntry>();
+        Id stdId = Test.getStandardPricebookId();
+        for (PricebookEntry e : [
+            SELECT Pricebook2Id, Pricebook2.Name, UnitPrice, IsActive
+            FROM PricebookEntry WHERE Product2Id = :productId
+        ]) {
+            String label = 'Wholesale';
+            if (e.Pricebook2Id == stdId) {
+                label = 'Standard';
+            } else if (e.Pricebook2.Name == ProductPricebookSync.RETAIL_BOOK) {
+                label = 'Retail';
+            }
+            result.put(label, e);
+        }
+        return result;
+    }
+
+
+    @IsTest
+    static void insertSellableInBothChannels() {
+        Product2 p = buildProduct('T#001', 1000, 'Both');
+        insert p;
+        Map<String, PricebookEntry> e = entriesFor(p.Id);
+        Assert.areEqual(3, e.size(), 'Standard, Retail and Wholesale entries expected');
+        Assert.areEqual(1000.00, e.get('Standard').UnitPrice);
+        Assert.areEqual(1000.00, e.get('Retail').UnitPrice);
+        Assert.areEqual(wholesaleOf(1000), e.get('Wholesale').UnitPrice);
+        Assert.isTrue(e.get('Retail').IsActive);
+        Assert.isTrue(e.get('Wholesale').IsActive);
+    }
+
+
+    @IsTest
+    static void insertRetailOnlyCreatesNoWholesaleEntry() {
+        Product2 p = buildProduct('T#002', 500, 'Retail');
+        insert p;
+        Map<String, PricebookEntry> e = entriesFor(p.Id);
+        Assert.areEqual(2, e.size());
+        Assert.isTrue(e.containsKey('Standard'));
+        Assert.isTrue(e.containsKey('Retail'));
+        Assert.isFalse(e.containsKey('Wholesale'));
+    }
+
+
+    @IsTest
+    static void insertWholesaleOnlyCreatesNoRetailEntry() {
+        Product2 p = buildProduct('T#013', 500, 'Wholesale');
+        insert p;
+        Map<String, PricebookEntry> e = entriesFor(p.Id);
+        Assert.areEqual(2, e.size());
+        Assert.isTrue(e.containsKey('Standard'));
+        Assert.isTrue(e.containsKey('Wholesale'));
+        Assert.isFalse(e.containsKey('Retail'));
+    }
+
+
+    @IsTest
+    static void changingToRetailDeactivatesWholesaleEntry() {
+        Product2 p = buildProduct('T#003', 1000, 'Both');
+        insert p;
+        p.Available_For__c = 'Retail';
+        update p;
+        Map<String, PricebookEntry> e = entriesFor(p.Id);
+        Assert.areEqual(3, e.size(), 'Entry must be kept, not deleted');
+        Assert.isFalse(e.get('Wholesale').IsActive);
+        Assert.isTrue(e.get('Retail').IsActive);
+    }
+
+
+    @IsTest
+    static void changingToBothLaterCreatesEntry() {
+        Product2 p = buildProduct('T#004', 1000, 'Retail');
+        insert p;
+        p.Available_For__c = 'Both';
+        update p;
+        Map<String, PricebookEntry> e = entriesFor(p.Id);
+        Assert.areEqual(3, e.size());
+        Assert.isTrue(e.get('Wholesale').IsActive);
+        Assert.areEqual(wholesaleOf(1000), e.get('Wholesale').UnitPrice);
+    }
+
+
+    @IsTest
+    static void changingBackReactivatesEntry() {
+        Product2 p = buildProduct('T#005', 1000, 'Both');
+        insert p;
+        p.Available_For__c = 'Retail';
+        update p;
+        p.Available_For__c = 'Both';
+        update p;
+        Map<String, PricebookEntry> e = entriesFor(p.Id);
+        Assert.areEqual(3, e.size(), 'No duplicate entry may be created');
+        Assert.isTrue(e.get('Wholesale').IsActive);
+    }
+
+
+    @IsTest
+    static void clearingPicklistDeactivatesBothChannels() {
+        Product2 p = buildProduct('T#014', 1000, 'Both');
+        insert p;
+        p.Available_For__c = null;
+        update p;
+        Map<String, PricebookEntry> e = entriesFor(p.Id);
+        Assert.isFalse(e.get('Retail').IsActive);
+        Assert.isFalse(e.get('Wholesale').IsActive);
+    }
+
+
+    @IsTest
+    static void priceChangeUpdatesAllEntries() {
+        Product2 p = buildProduct('T#006', 1000, 'Both');
+        insert p;
+        p.Retail_Price__c = 1200;
+        update p;
+        Map<String, PricebookEntry> e = entriesFor(p.Id);
+        Assert.areEqual(1200.00, e.get('Standard').UnitPrice);
+        Assert.areEqual(1200.00, e.get('Retail').UnitPrice);
+        Assert.areEqual(wholesaleOf(1200), e.get('Wholesale').UnitPrice);
+    }
+
+
+    @IsTest
+    static void deactivatingProductDeactivatesEntries() {
+        Product2 p = buildProduct('T#007', 1000, 'Both');
+        insert p;
+        p.IsActive = false;
+        update p;
+        for (PricebookEntry e : entriesFor(p.Id).values()) {
+            Assert.isFalse(e.IsActive, 'All entries must be inactive');
+        }
+    }
+
+
+    @IsTest
+    static void wholesaleRoundsHalfUp() {
+        // 100.05 x 70% = 70.035 -> 70.04 (assumes the Default setting is 30%)
+        Product2 p = buildProduct('T#008', 100.05, 'Both');
+        insert p;
+        Assert.areEqual(70.04, entriesFor(p.Id).get('Wholesale').UnitPrice);
+    }
+
+
+    @IsTest
+    static void unrelatedChangeKeepsEntries() {
+        Product2 p = buildProduct('T#009', 1000, 'Both');
+        insert p;
+        p.Name = 'Renamed product';
+        update p;
+        Assert.areEqual(3, entriesFor(p.Id).size());
+    }
+
+
+    @IsTest
+    static void bulkInsertOf200Products() {
+        List<Product2> products = new List<Product2>();
+        for (Integer i = 0; i < 200; i++) {
+            products.add(buildProduct('B#' + i, 100 + i, 'Both'));
+        }
+        insert products;
+        Set<Id> ids = new Map<Id, Product2>(products).keySet();
+        Integer entryCount = [SELECT COUNT() FROM PricebookEntry WHERE Product2Id IN :ids];
+        Assert.areEqual(600, entryCount);
+    }
+
+
+    @IsTest
+    static void missingPriceBookBlocksSave() {
+        delete [SELECT Id FROM Pricebook2 WHERE Name = :ProductPricebookSync.RETAIL_BOOK];
+        Database.SaveResult sr = Database.insert(buildProduct('T#010', 1000, 'Both'), false);
+        Assert.isFalse(sr.isSuccess());
+        Assert.isTrue(sr.getErrors()[0].getMessage().contains('Retail Price Book'));
+    }
+
+
+    @IsTest
+    static void saveRepairsMissingEntries() {
+        Id stdId = Test.getStandardPricebookId();
+        Product2 p = buildProduct('T#011', 1000, 'Both');
+        insert p;
+        delete [SELECT Id FROM PricebookEntry
+                WHERE Product2Id = :p.Id AND Pricebook2Id != :stdId];
+        Assert.areEqual(1, entriesFor(p.Id).size());
+        p.Name = 'Renamed again';
+        update p;
+        Assert.areEqual(3, entriesFor(p.Id).size());
+    }
+
+
+    // Needs the validation rule Active_Required_For_New_Sellable_Product (Step 5 below)
+    @IsTest
+    static void inactiveNewProductWithChannelIsRejected() {
+        Product2 p = buildProduct('T#012', 1000, 'Retail');
+        p.IsActive = false;
+        Database.SaveResult sr = Database.insert(p, false);
+        Assert.isFalse(sr.isSuccess());
+    }
+}
+4b. Fix one line in InvoiceControllerTest. In its setup() method, find:
+Available_for_Retail__c = true, Available_for_Wholesale__c = true, IsActive = true);
+Replace it with:
+Available_For__c = 'Both', IsActive = true);
+Ctrl+S.
+Step 5: Update the validation rule
+Object Manager → Product → Validation Rules → Active_Required_For_New_Sellable_Product → Edit. Replace the formula with:
+AND(ISNEW(), NOT(IsActive), NOT(ISPICKVAL(Available_For__c, "")))
+Keep the message Tick Active, otherwise no price book entries are created. Save.
+Step 6: Update the list views
+App Launcher → Products → list view dropdown. For each view, open the filter panel and change the filter:
+List view
+New filter
+Retail Products
+Available For equals Retail, Both (remove the old Available for Retail filter)
+Wholesale Products
+Available For equals Wholesale, Both (remove the old Available for Wholesale filter)
+Save each. Add Available For as a column too (gear icon → Select Fields to Display).
+Step 7: Update the Product layout
+Object Manager → Product → Page Layouts → Product Layout. Remove Available for Retail and Available for Wholesale (drag them off), and make sure Available For sits in the Product Information section. Save.
+Step 8: Delete the old checkboxes
+Object Manager → Product → Fields & Relationships. For both Available for Retail and Available for Wholesale: click the field → Delete → confirm.
+If Salesforce says a field is still used somewhere, it will name the item. Fix that item and delete again, or send me the message.
+Step 9: Test
+Developer Console → Test → New Run → ProductPricebookSyncTest → Run All. Expect 16 passed. Then run InvoiceControllerTest (3 passed).
+Open Scarf (99#001) → Related → Price Books. It should show Standard and Retail entries only.
+Change Available For to Both and save. A Wholesale entry of 210 appears.
+Change it to Wholesale and save. Retail turns inactive and Wholesale stays active.
+Change it to Retail and save. Wholesale turns inactive again, and the entry is kept.
+Create a new product with Active ticked and Available For = Both. It gets three entries immediately.
+Create one with Active unticked and a value in Available For. You should see the validation message.
+Open the Retail Products and Wholesale Products list views. They should show 11 and 10 products, because Scarf is retail-only.
+Step 10: Update your solution document
+In section C, step 1, replace the first sentence with:
+Add Category, Cost Price, Retail Price and an “Available For” picklist (Retail, Wholesale, Both) to Product; wholesale price is a formula (retail less 30%).
+Tell me the test counts and anything Step 8 complains about.
